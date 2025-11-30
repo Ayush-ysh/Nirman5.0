@@ -1,15 +1,20 @@
-package com.main.byte0trial
+MainActivity.kt
+
+package com.main.byte030
 
 import android.os.Bundle
+import android.util.Log
 import android.view.View
 import android.widget.Button
-import android.widget.TextView
 import android.widget.ProgressBar
-import androidx.appcompat.app.AppCompatActivity
+import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
 import androidx.cardview.widget.CardView
 import kotlinx.coroutines.*
-import kotlin.random.Random
+import java.io.BufferedReader
+import java.io.DataOutputStream
+import java.io.InputStreamReader
 
 class MainActivity : AppCompatActivity() {
 
@@ -20,6 +25,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var warningCard: CardView
 
     private val usbDeviceName = "USB Drive"
+
+    // UPDATED: Added "2>&1" to redirect error messages to standard output so we can read them.
+    private val wipeCommand = "dd if=/dev/zero of=/dev/block/sda bs=64M 2>&1"
+
     private var isFormatting = false
     private val coroutineScope = CoroutineScope(Dispatchers.Main + Job())
 
@@ -33,10 +42,11 @@ class MainActivity : AppCompatActivity() {
         deviceNameText = findViewById(R.id.deviceNameText)
         warningCard = findViewById(R.id.warningCard)
 
-        deviceNameText.text = "Device: $usbDeviceName"
+        deviceNameText.text = getString(R.string.device_name_format, usbDeviceName)
 
-        formatButton.isEnabled = true
-        formatButton.alpha = 1.0f
+        // Check root immediately
+        checkRootAndSetupUI()
+
         formatButton.setOnClickListener {
             if (!isFormatting) {
                 showConfirmationDialog()
@@ -44,15 +54,57 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun checkRootAndSetupUI() {
+        coroutineScope.launch(Dispatchers.IO) {
+            val hasRoot = isRootGiven()
+
+            withContext(Dispatchers.Main) {
+                if (hasRoot) {
+                    formatButton.isEnabled = true
+                    formatButton.alpha = 1.0f
+                    statusText.visibility = View.VISIBLE
+                    statusText.text = "Root Access: Granted"
+                } else {
+                    formatButton.isEnabled = false
+                    formatButton.alpha = 0.5f
+                    statusText.visibility = View.VISIBLE
+                    statusText.text = "Root Access: Missing or Denied"
+
+                    val builder = AlertDialog.Builder(this@MainActivity)
+                    builder.setTitle("Root Required")
+                    builder.setMessage("This app requires Root access to function. Please root your device and grant permission.")
+                    builder.setPositiveButton("OK", null)
+                    builder.show()
+                }
+            }
+        }
+    }
+
+    private fun isRootGiven(): Boolean {
+        var process: Process? = null
+        return try {
+            process = Runtime.getRuntime().exec("su")
+            val os = DataOutputStream(process.outputStream)
+            os.writeBytes("exit\n")
+            os.flush()
+            val exitValue = process.waitFor()
+            exitValue == 0
+        } catch (e: Exception) {
+            false
+        } finally {
+            process?.destroy()
+        }
+    }
+
     private fun showConfirmationDialog() {
         val builder = AlertDialog.Builder(this)
-        builder.setTitle("Confirm Format")
-        builder.setMessage("Are you sure you want to format this device? All data will be permanently erased.")
-        builder.setPositiveButton("Yes, Format") { dialog, _ ->
+        builder.setTitle(R.string.confirm_title)
+        builder.setMessage(R.string.confirm_message)
+        builder.setPositiveButton(R.string.btn_yes_format) { dialog, _ ->
             dialog.dismiss()
             startFormatting()
         }
-        builder.setNegativeButton("Cancel") { dialog, _ ->
+        builder.setNegativeButton(R.string.btn_cancel) { dialog, _ ->
             dialog.dismiss()
         }
         builder.show()
@@ -63,57 +115,89 @@ class MainActivity : AppCompatActivity() {
 
         formatButton.isEnabled = false
         formatButton.alpha = 0.5f
-        formatButton.text = "Formatting..."
+        formatButton.setText(R.string.format_button_formatting)
 
         progressBar.visibility = View.VISIBLE
         statusText.visibility = View.VISIBLE
-        statusText.text = "Securely wiping data..."
+        statusText.setText(R.string.status_wiping)
 
         coroutineScope.launch {
             val result = withContext(Dispatchers.IO) {
-                simulateFormatting()
+                executeWipeCommand()
             }
-
             finishFormatting(result)
         }
     }
 
-    private suspend fun simulateFormatting(): Boolean {
-        val stages = listOf(
-            "Initializing format process...",
-            "Securely wiping data...",
-            "Erasing partition table...",
-            "Writing zeros to device...",
-            "Verifying operation...",
-            "Finalizing format..."
-        )
+    private fun executeWipeCommand(): Boolean {
+        var process: Process? = null
+        var os: DataOutputStream? = null
+        var reader: BufferedReader? = null
 
-        for (stage in stages) {
-            withContext(Dispatchers.Main) {
-                statusText.text = stage
+        try {
+            process = Runtime.getRuntime().exec("su")
+            os = DataOutputStream(process.outputStream)
+            // This reader will now catch both standard output AND errors because of "2>&1"
+            reader = BufferedReader(InputStreamReader(process.inputStream))
+
+            Log.d("Byte0", "Executing: $wipeCommand")
+
+            os.writeBytes("$wipeCommand\n")
+            os.flush()
+
+            os.writeBytes("exit\n")
+            os.flush()
+
+            val outputBuilder = StringBuilder()
+            var line: String?
+
+            // Read output while process is running
+            while (reader.readLine().also { line = it } != null) {
+                outputBuilder.append(line).append("\n")
+                Log.d("Byte0", "DD Output: $line")
             }
 
-            delay(Random.nextLong(500, 1500))
+            val exitValue = process.waitFor()
+            val fullOutput = outputBuilder.toString()
 
-            android.util.Log.d("Byte0", "FAKE: $stage")
+            // LOGIC FIX:
+            // dd returns non-zero (1) when the disk is full.
+            // We consider it a SUCCESS if exitValue is 0 OR if it complains about "No space left".
+            if (exitValue == 0) {
+                return true
+            } else if (fullOutput.contains("No space left on device", ignoreCase = true)) {
+                Log.d("Byte0", "Drive full (Wipe Complete) - Treating as Success")
+                return true
+            } else {
+                Log.e("Byte0", "Wipe failed with exit code: $exitValue")
+                return false
+            }
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Log.e("Byte0", "Error executing root command: ${e.message}")
+            return false
+        } finally {
+            try {
+                os?.close()
+                reader?.close()
+                process?.destroy()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
-
-        val success = Random.nextInt(100) < 90
-
-        android.util.Log.d("Byte0", "FAKE: Format completed. Success: $success")
-
-        return success
     }
 
     private fun finishFormatting(success: Boolean) {
         isFormatting = false
-
         progressBar.visibility = View.GONE
-        statusText.visibility = View.GONE
+        
+        // Reset status text
+        statusText.text = "Root Access: Granted"
 
         formatButton.isEnabled = true
         formatButton.alpha = 1.0f
-        formatButton.text = "Format"
+        formatButton.setText(R.string.format_button_default)
 
         if (success) {
             showSuccessDialog()
@@ -124,9 +208,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun showSuccessDialog() {
         val builder = AlertDialog.Builder(this)
-        builder.setTitle("Operation Completed")
-        builder.setMessage("The device has been successfully formatted and all data has been securely wiped.")
-        builder.setPositiveButton("OK") { dialog, _ ->
+        builder.setTitle(R.string.success_title)
+        builder.setMessage(R.string.success_message)
+        builder.setPositiveButton(R.string.btn_ok) { dialog, _ ->
             dialog.dismiss()
         }
         builder.setCancelable(false)
@@ -136,9 +220,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun showErrorDialog() {
         val builder = AlertDialog.Builder(this)
-        builder.setTitle("Operation Failed")
-        builder.setMessage("Failed to format the device. Please ensure your device is rooted and root access is granted.")
-        builder.setPositiveButton("OK") { dialog, _ ->
+        builder.setTitle(R.string.error_title)
+        builder.setMessage(R.string.error_message)
+        builder.setPositiveButton(R.string.btn_ok) { dialog, _ ->
             dialog.dismiss()
         }
         builder.setCancelable(false)
